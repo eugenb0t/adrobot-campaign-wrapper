@@ -31,21 +31,30 @@ class KeitaroClient:
         if not self.configured:
             raise HTTPException(status_code=503, detail="Keitaro API не настроен. Заполните KEITARO_BASE_URL и KEITARO_API_KEY.")
         try:
-            if self._client is not None:
-                response = await self._client.request(method, path.lstrip("/"), **kwargs)
-            else:
+            try:
+                if self._client is not None:
+                    response = await self._client.request(method, path.lstrip("/"), **kwargs)
+                else:
+                    async with httpx.AsyncClient(timeout=settings.keitaro_timeout) as client:
+                        response = await client.request(method, f"{self.base_url}/admin_api/v1/{path.lstrip('/')}", headers=self.headers, **kwargs)
+            except (httpx.TimeoutException, httpx.RemoteProtocolError):
+                # Some tracker/proxy connections become stale after long sessions.
+                # Retrying reads and idempotent replacements on a fresh connection
+                # is safe; POSTs are deliberately never retried to avoid duplicates.
+                if method.upper() not in {"GET", "PUT"}:
+                    raise
                 async with httpx.AsyncClient(timeout=settings.keitaro_timeout) as client:
                     response = await client.request(method, f"{self.base_url}/admin_api/v1/{path.lstrip('/')}", headers=self.headers, **kwargs)
             response.raise_for_status()
             return response.json() if response.content else None
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
-            raise HTTPException(status_code=502, detail=f"Keitaro API вернул {exc.response.status_code}: {detail}") from exc
+            raise HTTPException(status_code=502, detail=f"{method} {path}: Keitaro API вернул {exc.response.status_code}: {detail}") from exc
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Не удалось связаться с Keitaro: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"{method} {path}: не удалось связаться с Keitaro ({type(exc).__name__})") from exc
 
-    async def resources(self, path: str) -> list[dict[str, Any]]:
-        result = await self.request("GET", path)
+    async def resources(self, path: str, *, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        result = await self.request("GET", path, params=params)
         if isinstance(result, list):
             return result
         if isinstance(result, dict):
@@ -55,7 +64,25 @@ class KeitaroClient:
         raise HTTPException(status_code=502, detail=f"Неожиданный формат ответа Keitaro для {path}")
 
     async def list_campaigns(self) -> list[dict[str, Any]]:
-        return await self.resources("campaigns")
+        # Keitaro can take a long time to return an unbounded campaign list.
+        # Use the documented limit/offset parameters and collect every page.
+        # Prefer efficient large pages, then shrink a page if an older record
+        # makes that response too large for this tracker to return in time.
+        page_size = 100
+        campaigns: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            try:
+                page = await self.resources("campaigns", params={"limit": page_size, "offset": offset})
+            except HTTPException as exc:
+                if page_size > 1:
+                    page_size = max(1, page_size // 2)
+                    continue
+                raise HTTPException(status_code=exc.status_code, detail=f"Не удалось загрузить кампанию начиная с позиции {offset}: {exc.detail}") from exc
+            campaigns.extend(page)
+            if len(page) < page_size:
+                return campaigns
+            offset += len(page)
 
     async def campaign_streams(self, campaign_id: int) -> list[dict[str, Any]]:
         return await self.resources(f"campaigns/{campaign_id}/streams")
@@ -89,22 +116,40 @@ class KeitaroClient:
                 "campaign_id": campaign_id,
                 "name": "Google · выбранное GEO",
                 "type": "regular",
+                "state": "active",
                 "position": 1,
                 "schema": "redirect",
                 "action_type": "http",
                 "action_payload": "https://www.google.com/",
+                "action_options": None,
+                "offer_selection": "before_click",
+                "landings": [],
+                "offers": [],
+                "weight": 0,
                 "collect_clicks": True,
+                "comments": "",
                 "filter_or": False,
                 "filters": [{"name": "country", "mode": "allow", "payload": [data["country_code"]]}],
+                "triggers": [],
             })
             await self.request("POST", "streams", json={
                 "campaign_id": campaign_id,
                 "name": "Оффер · fallback",
-                "type": "default",
+                "type": "regular",
+                "state": "active",
                 "position": 2,
-                "schema": "offers",
+                "schema": "landings",
                 "action_type": "http",
+                "action_payload": None,
+                "action_options": None,
+                "offer_selection": "before_click",
+                "landings": [],
                 "collect_clicks": True,
+                "comments": "",
+                "filter_or": False,
+                "filters": [],
+                "triggers": [],
+                "weight": 0,
                 "offers": [{"offer_id": data["offer_id"], "share": 100, "state": "active"}],
             })
         except HTTPException:
@@ -118,7 +163,9 @@ class KeitaroClient:
 
     async def update_campaign_offers(self, campaign_id: int, offer_ids: list[int]) -> None:
         streams = await self.resources(f"campaigns/{campaign_id}/streams")
-        target = next((stream for stream in streams if stream.get("type") == "default" or stream.get("name") == "Оффер · fallback"), None)
+        target = next((stream for stream in streams if stream.get("name") == "Оффер · fallback"), None)
+        if target is None:
+            target = next((stream for stream in streams if stream.get("type") == "default"), None)
         if target is None:
             raise HTTPException(status_code=409, detail="В кампании не найден поток оффера")
         base_share, remainder = divmod(100, len(offer_ids))

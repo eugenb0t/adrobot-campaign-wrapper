@@ -6,7 +6,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base, get_db
+from app.keitaro import keitaro
 from app.main import app
+from app import main
 
 
 @pytest.fixture
@@ -20,10 +22,14 @@ def client(tmp_path) -> Iterator[TestClient]:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    original_keitaro_configured = keitaro.configured
+    keitaro.configured = False
+    main._last_keitaro_sync = 0.0
     try:
         with TestClient(app) as test_client:
             yield test_client
     finally:
+        keitaro.configured = original_keitaro_configured
         app.dependency_overrides.clear()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()

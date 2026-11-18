@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 import logging
+import time
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import FileResponse
@@ -15,6 +16,8 @@ from app.schemas import CampaignCreate, CampaignRead, CampaignUpdate, OfferUpdat
 
 BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
+_keitaro_sync_ttl = 60.0
+_last_keitaro_sync = 0.0
 
 
 @asynccontextmanager
@@ -44,45 +47,26 @@ def health() -> dict[str, str | bool]:
 
 @app.get("/api/campaigns", response_model=list[CampaignRead])
 async def list_campaigns(db: Session = Depends(get_db), q: str | None = Query(default=None, max_length=100)):
-    if keitaro.configured:
+    global _last_keitaro_sync
+    if keitaro.configured and time.monotonic() - _last_keitaro_sync >= _keitaro_sync_ttl:
         remote_campaigns = await keitaro.list_campaigns()
         for remote in remote_campaigns:
             remote_id = remote.get("id") or remote.get("campaign_id")
             if not remote_id:
                 continue
-            streams = remote.get("streams") or await keitaro.campaign_streams(int(remote_id))
-            offer_ids = list(dict.fromkeys(
-                int(offer.get("offer_id") or offer.get("id"))
-                for stream in streams
-                for offer in stream.get("offers", [])
-                if offer.get("offer_id") or offer.get("id")
-            ))
-            country = "--"
-            for stream in streams:
-                for filter_item in stream.get("filters") or []:
-                    if filter_item.get("name") == "country":
-                        raw_country = filter_item.get("payload", "--")
-                        if isinstance(raw_country, list):
-                            raw_country = raw_country[0] if raw_country else "--"
-                        country = str(raw_country or "--")[:2].upper()
-                        break
             record = db.scalar(select(Campaign).where(Campaign.keitaro_id == int(remote_id)))
             if record is None:
                 record = Campaign(
                     name=remote.get("name", f"Кампания {remote_id}"),
-                    country_code=country,
-                    offer_id=offer_ids[0] if offer_ids else 1,
-                    offers=offer_ids,
+                    country_code="--",
+                    offer_id=1,
+                    offers=[],
                     keitaro_id=int(remote_id),
                     status="paused" if remote.get("state") in ("disabled", "paused") else "active",
                 )
                 db.add(record)
             else:
                 record.name = remote.get("name", record.name)
-                record.country_code = country
-                if offer_ids:
-                    record.offer_id = offer_ids[0]
-                    record.offers = offer_ids
                 record.status = "paused" if remote.get("state") in ("disabled", "paused") else "active"
         db.flush()
         try:
@@ -102,6 +86,7 @@ async def list_campaigns(db: Session = Depends(get_db), q: str | None = Query(de
             keitaro.statistics_available = False
             logger.warning("Keitaro report unavailable: %s", exc.detail)
         db.commit()
+        _last_keitaro_sync = time.monotonic()
     statement = select(Campaign).order_by(Campaign.created_at.desc())
     if q:
         statement = statement.where(Campaign.name.ilike(f"%{q}%"))
@@ -134,10 +119,31 @@ async def create_campaign(payload: CampaignCreate, db: Session = Depends(get_db)
 
 
 @app.get("/api/campaigns/{campaign_id}", response_model=CampaignRead)
-def get_campaign(campaign_id: int, db: Session = Depends(get_db)):
+async def get_campaign(campaign_id: int, db: Session = Depends(get_db)):
     campaign = db.get(Campaign, campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Кампания не найдена")
+    if campaign.keitaro_id and (not campaign.offers or campaign.country_code == "--"):
+        streams = await keitaro.campaign_streams(campaign.keitaro_id)
+        offer_ids = list(dict.fromkeys(
+            int(offer.get("offer_id") or offer.get("id"))
+            for stream in streams
+            for offer in stream.get("offers", [])
+            if offer.get("offer_id") or offer.get("id")
+        ))
+        country = next((
+            str((item.get("payload") or ["--"])[0] if isinstance(item.get("payload"), list) else item.get("payload") or "--")[:2].upper()
+            for stream in streams
+            for item in stream.get("filters") or []
+            if item.get("name") == "country"
+        ), "--")
+        if offer_ids:
+            campaign.offer_id = offer_ids[0]
+            campaign.offers = offer_ids
+        if country != "--":
+            campaign.country_code = country
+        db.commit()
+        db.refresh(campaign)
     return campaign
 
 
@@ -205,4 +211,5 @@ async def list_resources(resource_name: str):
         raise HTTPException(status_code=404, detail="Неизвестный справочник")
     if not keitaro.configured:
         return []
-    return await keitaro.resources(paths[resource_name])
+    params = {"type": "campaigns"} if resource_name == "groups" else None
+    return await keitaro.resources(paths[resource_name], params=params)
