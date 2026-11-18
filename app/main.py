@@ -1,4 +1,6 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
+import logging
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import FileResponse
@@ -12,9 +14,17 @@ from app.models import Campaign
 from app.schemas import CampaignCreate, CampaignRead, CampaignUpdate, OfferUpdate
 
 BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 
-app = FastAPI(title="Adrobot · Campaign desk", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await keitaro.open()
+    yield
+    await keitaro.close()
+
+
+app = FastAPI(title="Adrobot · Campaign desk", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
@@ -25,7 +35,11 @@ def index() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict[str, str | bool]:
-    return {"status": "ok", "keitaro_connected": keitaro.configured}
+    return {
+        "status": "ok",
+        "keitaro_configured": keitaro.configured,
+        "statistics_available": keitaro.statistics_available is not False,
+    }
 
 
 @app.get("/api/campaigns", response_model=list[CampaignRead])
@@ -70,17 +84,23 @@ async def list_campaigns(db: Session = Depends(get_db), q: str | None = Query(de
                     record.offer_id = offer_ids[0]
                     record.offers = offer_ids
                 record.status = "paused" if remote.get("state") in ("disabled", "paused") else "active"
-        report = await keitaro.campaign_report()
-        for row in report.get("rows", []):
-            remote_id = row.get("campaign_id")
-            if not remote_id:
-                continue
-            record = db.scalar(select(Campaign).where(Campaign.keitaro_id == int(remote_id)))
-            if record:
-                record.visits = int(float(row.get("clicks") or 0))
-                record.conversions = int(float(row.get("conversions") or 0))
-                record.revenue = float(row.get("revenue") or 0)
-                record.cost = float(row.get("cost") or 0)
+        db.flush()
+        try:
+            report = await keitaro.campaign_report()
+            keitaro.statistics_available = True
+            for row in report.get("rows", []):
+                remote_id = row.get("campaign_id")
+                if not remote_id:
+                    continue
+                record = db.scalar(select(Campaign).where(Campaign.keitaro_id == int(remote_id)))
+                if record:
+                    record.visits = int(float(row.get("clicks") or 0))
+                    record.conversions = int(float(row.get("conversions") or 0))
+                    record.revenue = float(row.get("revenue") or 0)
+                    record.cost = float(row.get("cost") or 0)
+        except HTTPException as exc:
+            keitaro.statistics_available = False
+            logger.warning("Keitaro report unavailable: %s", exc.detail)
         db.commit()
     statement = select(Campaign).order_by(Campaign.created_at.desc())
     if q:
@@ -99,7 +119,16 @@ async def create_campaign(payload: CampaignCreate, db: Session = Depends(get_db)
             raise HTTPException(status_code=502, detail="Keitaro создал кампанию, но не вернул её ID")
     campaign = Campaign(**record, keitaro_id=remote_id, offers=[payload.offer_id])
     db.add(campaign)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        if remote_id:
+            try:
+                await keitaro.delete_campaign(remote_id)
+            except HTTPException:
+                logger.exception("Could not roll back remote campaign %s after database failure", remote_id)
+        raise
     db.refresh(campaign)
     return campaign
 

@@ -15,15 +15,29 @@ class KeitaroClient:
         self.configured = bool(settings.keitaro_base_url and settings.keitaro_api_key)
         self.base_url = settings.keitaro_base_url.rstrip("/")
         self.headers = {"Api-Key": settings.keitaro_api_key}
+        self._client: httpx.AsyncClient | None = None
+        self.statistics_available: bool | None = None
+
+    async def open(self) -> None:
+        if self.configured and self._client is None:
+            self._client = httpx.AsyncClient(base_url=f"{self.base_url}/admin_api/v1/", headers=self.headers, timeout=settings.keitaro_timeout)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
         if not self.configured:
             raise HTTPException(status_code=503, detail="Keitaro API не настроен. Заполните KEITARO_BASE_URL и KEITARO_API_KEY.")
         try:
-            async with httpx.AsyncClient(timeout=settings.keitaro_timeout) as client:
-                response = await client.request(method, f"{self.base_url}/admin_api/v1/{path.lstrip('/')}", headers=self.headers, **kwargs)
-                response.raise_for_status()
-                return response.json() if response.content else None
+            if self._client is not None:
+                response = await self._client.request(method, path.lstrip("/"), **kwargs)
+            else:
+                async with httpx.AsyncClient(timeout=settings.keitaro_timeout) as client:
+                    response = await client.request(method, f"{self.base_url}/admin_api/v1/{path.lstrip('/')}", headers=self.headers, **kwargs)
+            response.raise_for_status()
+            return response.json() if response.content else None
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
             raise HTTPException(status_code=502, detail=f"Keitaro API вернул {exc.response.status_code}: {detail}") from exc
@@ -32,7 +46,13 @@ class KeitaroClient:
 
     async def resources(self, path: str) -> list[dict[str, Any]]:
         result = await self.request("GET", path)
-        return result if isinstance(result, list) else result.get("data", result.get("offers", []))
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            rows = result.get("data", result.get("offers", result.get("campaigns", [])))
+            if isinstance(rows, list):
+                return rows
+        raise HTTPException(status_code=502, detail=f"Неожиданный формат ответа Keitaro для {path}")
 
     async def list_campaigns(self) -> list[dict[str, Any]]:
         return await self.resources("campaigns")
@@ -41,11 +61,14 @@ class KeitaroClient:
         return await self.resources(f"campaigns/{campaign_id}/streams")
 
     async def campaign_report(self) -> dict[str, Any]:
-        return await self.request("POST", "report/build", json={
+        result = await self.request("POST", "report/build", json={
             "range": {"interval": "all_time"},
             "grouping": ["campaign_id"],
             "metrics": ["clicks", "conversions", "revenue", "cost"],
         })
+        if not isinstance(result, dict) or not isinstance(result.get("rows"), list):
+            raise HTTPException(status_code=502, detail="Keitaro вернул отчёт в неожиданном формате")
+        return result
 
     async def create_campaign(self, data: dict[str, Any]) -> dict[str, Any]:
         campaign_payload = {
