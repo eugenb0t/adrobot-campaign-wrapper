@@ -43,8 +43,8 @@ class OfferUpdate(BaseModel):
 class CampaignRead(BaseModel):
     id: int
     name: str
-    country_code: str
-    offer_id: int
+    country_code: str | None
+    offer_id: int | None
     domain_id: int | None
     group_id: int | None
     traffic_source_id: int | None

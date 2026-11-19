@@ -1,4 +1,16 @@
 from app import main
+import asyncio
+import time
+
+
+def wait_for_sync(client, keitaro_id):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        response = client.get("/api/campaigns")
+        if any(row["keitaro_id"] == keitaro_id for row in response.json()):
+            return response
+        time.sleep(0.01)
+    raise AssertionError("Keitaro sync did not finish")
 
 
 def test_campaign_crud_and_offer_editor(client):
@@ -60,9 +72,11 @@ def test_keitaro_campaign_sync_imports_campaigns_and_report_without_stream_fanou
     monkeypatch.setattr(main, "keitaro", FakeKeitaro())
     response = client.get("/api/campaigns")
     assert response.status_code == 200
+    response = wait_for_sync(client, 912)
     campaign = response.json()[0]
     assert campaign["keitaro_id"] == 912
-    assert campaign["country_code"] == "--"
+    assert campaign["country_code"] is None
+    assert campaign["offer_id"] is None
     assert campaign["offers"] == []
     assert campaign["visits"] == 1250
     assert campaign["conversions"] == 75
@@ -71,6 +85,27 @@ def test_keitaro_campaign_sync_imports_campaigns_and_report_without_stream_fanou
     assert main.keitaro.statistics_available is True
     assert client.get("/api/campaigns").status_code == 200
     assert calls == ["campaigns", "report"]
+
+
+def test_keitaro_sync_does_not_block_campaign_list(client, monkeypatch):
+    class SlowKeitaro:
+        configured = True
+        statistics_available = None
+
+        async def list_campaigns(self):
+            await asyncio.sleep(0.25)
+            return [{"id": 914, "name": "test_slow_campaign", "state": "active"}]
+
+        async def campaign_report(self):
+            return {"rows": []}
+
+    monkeypatch.setattr(main, "keitaro", SlowKeitaro())
+    response = client.get("/api/campaigns")
+    assert response.status_code == 200
+    assert response.json() == []
+    assert client.get("/api/health").json()["sync_in_progress"] is True
+    result = wait_for_sync(client, 914)
+    assert result.json()[0]["name"] == "test_slow_campaign"
 
 
 def test_groups_resource_uses_campaign_group_type(client, monkeypatch):
@@ -109,6 +144,7 @@ def test_campaign_detail_loads_streams_on_demand(client, monkeypatch):
     monkeypatch.setattr(main, "keitaro", FakeKeitaro())
     response = client.get("/api/campaigns")
     assert response.status_code == 200
+    response = wait_for_sync(client, 913)
     campaign = response.json()[0]
     assert campaign["keitaro_id"] == 913
     assert campaign["offers"] == []

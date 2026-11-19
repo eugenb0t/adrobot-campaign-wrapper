@@ -39,9 +39,10 @@ class KeitaroClient:
                         response = await client.request(method, f"{self.base_url}/admin_api/v1/{path.lstrip('/')}", headers=self.headers, **kwargs)
             except (httpx.TimeoutException, httpx.RemoteProtocolError):
                 # Some tracker/proxy connections become stale after long sessions.
-                # Retrying reads and idempotent replacements on a fresh connection
-                # is safe; POSTs are deliberately never retried to avoid duplicates.
-                if method.upper() not in {"GET", "PUT"}:
+                # report/build is a read-only POST; retrying it cannot create a
+                # duplicate remote resource. Other POST operations remain single-shot.
+                read_only_post = method.upper() == "POST" and path.strip("/") == "report/build"
+                if method.upper() not in {"GET", "PUT"} and not read_only_post:
                     raise
                 async with httpx.AsyncClient(timeout=settings.keitaro_timeout) as client:
                     response = await client.request(method, f"{self.base_url}/admin_api/v1/{path.lstrip('/')}", headers=self.headers, **kwargs)

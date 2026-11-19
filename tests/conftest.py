@@ -22,14 +22,21 @@ def client(tmp_path) -> Iterator[TestClient]:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    original_session_local = main.SessionLocal
+    main.SessionLocal = TestingSession
     original_keitaro_configured = keitaro.configured
     keitaro.configured = False
     main._last_keitaro_sync = 0.0
+    main._last_keitaro_sync_at = None
+    main._sync_in_progress = False
+    main._sync_error = None
+    main._sync_task = None
     try:
         with TestClient(app) as test_client:
             yield test_client
     finally:
         keitaro.configured = original_keitaro_configured
+        main.SessionLocal = original_session_local
         app.dependency_overrides.clear()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()

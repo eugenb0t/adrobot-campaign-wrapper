@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+import asyncio
 from pathlib import Path
 import logging
 import time
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import FileResponse
@@ -9,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.keitaro import keitaro
 from app.models import Campaign
 from app.schemas import CampaignCreate, CampaignRead, CampaignUpdate, OfferUpdate
@@ -18,6 +20,10 @@ BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
 _keitaro_sync_ttl = 60.0
 _last_keitaro_sync = 0.0
+_last_keitaro_sync_at: float | None = None
+_sync_in_progress = False
+_sync_error: str | None = None
+_sync_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -37,56 +43,78 @@ def index() -> FileResponse:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str | bool]:
+def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "keitaro_configured": keitaro.configured,
-        "statistics_available": keitaro.statistics_available is not False,
+        "statistics_available": keitaro.statistics_available,
+        "last_sync_at": _last_keitaro_sync_at,
+        "sync_in_progress": _sync_in_progress,
+        "sync_error": _sync_error,
     }
 
 
-@app.get("/api/campaigns", response_model=list[CampaignRead])
-async def list_campaigns(db: Session = Depends(get_db), q: str | None = Query(default=None, max_length=100)):
-    global _last_keitaro_sync
-    if keitaro.configured and time.monotonic() - _last_keitaro_sync >= _keitaro_sync_ttl:
+async def _sync_keitaro_campaigns() -> None:
+    global _last_keitaro_sync, _last_keitaro_sync_at, _sync_in_progress, _sync_error, _sync_task
+    _sync_in_progress = True
+    _sync_error = None
+    try:
         remote_campaigns = await keitaro.list_campaigns()
-        for remote in remote_campaigns:
-            remote_id = remote.get("id") or remote.get("campaign_id")
-            if not remote_id:
-                continue
-            record = db.scalar(select(Campaign).where(Campaign.keitaro_id == int(remote_id)))
-            if record is None:
-                record = Campaign(
-                    name=remote.get("name", f"Кампания {remote_id}"),
-                    country_code="--",
-                    offer_id=1,
-                    offers=[],
-                    keitaro_id=int(remote_id),
-                    status="paused" if remote.get("state") in ("disabled", "paused") else "active",
-                )
-                db.add(record)
-            else:
-                record.name = remote.get("name", record.name)
-                record.status = "paused" if remote.get("state") in ("disabled", "paused") else "active"
-        db.flush()
-        try:
-            report = await keitaro.campaign_report()
-            keitaro.statistics_available = True
-            for row in report.get("rows", []):
-                remote_id = row.get("campaign_id")
+        with SessionLocal() as db:
+            for remote in remote_campaigns:
+                remote_id = remote.get("id") or remote.get("campaign_id")
                 if not remote_id:
                     continue
                 record = db.scalar(select(Campaign).where(Campaign.keitaro_id == int(remote_id)))
-                if record:
-                    record.visits = int(float(row.get("clicks") or 0))
-                    record.conversions = int(float(row.get("conversions") or 0))
-                    record.revenue = float(row.get("revenue") or 0)
-                    record.cost = float(row.get("cost") or 0)
-        except HTTPException as exc:
-            keitaro.statistics_available = False
-            logger.warning("Keitaro report unavailable: %s", exc.detail)
-        db.commit()
+                if record is None:
+                    record = Campaign(
+                        name=remote.get("name", f"Кампания {remote_id}"),
+                        country_code=None,
+                        offer_id=None,
+                        offers=[],
+                        keitaro_id=int(remote_id),
+                        status="paused" if remote.get("state") in ("disabled", "paused") else "active",
+                    )
+                    db.add(record)
+                else:
+                    record.name = remote.get("name", record.name)
+                    record.status = "paused" if remote.get("state") in ("disabled", "paused") else "active"
+            db.flush()
+            try:
+                report = await keitaro.campaign_report()
+                keitaro.statistics_available = True
+                for row in report.get("rows", []):
+                    remote_id = row.get("campaign_id")
+                    if not remote_id:
+                        continue
+                    record = db.scalar(select(Campaign).where(Campaign.keitaro_id == int(remote_id)))
+                    if record:
+                        record.visits = int(float(row.get("clicks") or 0))
+                        record.conversions = int(float(row.get("conversions") or 0))
+                        record.revenue = float(row.get("revenue") or 0)
+                        record.cost = float(row.get("cost") or 0)
+            except HTTPException as exc:
+                keitaro.statistics_available = False
+                logger.warning("Keitaro report unavailable: %s", exc.detail)
+            db.commit()
         _last_keitaro_sync = time.monotonic()
+        _last_keitaro_sync_at = time.time()
+    except Exception as exc:
+        _sync_error = str(exc)
+        keitaro.statistics_available = False
+        logger.exception("Keitaro campaign sync failed")
+    finally:
+        _sync_in_progress = False
+        _sync_task = None
+
+
+@app.get("/api/campaigns", response_model=list[CampaignRead])
+async def list_campaigns(db: Session = Depends(get_db), q: str | None = Query(default=None, max_length=100), refresh: bool = Query(default=False)):
+    global _sync_in_progress, _sync_error, _sync_task
+    if keitaro.configured and not _sync_in_progress and (refresh or time.monotonic() - _last_keitaro_sync >= _keitaro_sync_ttl):
+        _sync_in_progress = True
+        _sync_error = None
+        _sync_task = asyncio.create_task(_sync_keitaro_campaigns())
     statement = select(Campaign).order_by(Campaign.created_at.desc())
     if q:
         statement = statement.where(Campaign.name.ilike(f"%{q}%"))
@@ -123,7 +151,7 @@ async def get_campaign(campaign_id: int, db: Session = Depends(get_db)):
     campaign = db.get(Campaign, campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Кампания не найдена")
-    if campaign.keitaro_id and (not campaign.offers or campaign.country_code == "--"):
+    if campaign.keitaro_id and (not campaign.offers or not campaign.country_code):
         streams = await keitaro.campaign_streams(campaign.keitaro_id)
         offer_ids = list(dict.fromkeys(
             int(offer.get("offer_id") or offer.get("id"))
@@ -132,15 +160,15 @@ async def get_campaign(campaign_id: int, db: Session = Depends(get_db)):
             if offer.get("offer_id") or offer.get("id")
         ))
         country = next((
-            str((item.get("payload") or ["--"])[0] if isinstance(item.get("payload"), list) else item.get("payload") or "--")[:2].upper()
+            str((item.get("payload") or [""])[0] if isinstance(item.get("payload"), list) else item.get("payload") or "")[:2].upper()
             for stream in streams
             for item in stream.get("filters") or []
             if item.get("name") == "country"
-        ), "--")
+        ), "")
         if offer_ids:
             campaign.offer_id = offer_ids[0]
             campaign.offers = offer_ids
-        if country != "--":
+        if country:
             campaign.country_code = country
         db.commit()
         db.refresh(campaign)
